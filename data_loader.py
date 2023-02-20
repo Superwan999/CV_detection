@@ -1,4 +1,3 @@
-import glob
 import random
 import os
 import sys
@@ -10,6 +9,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.utils.data import Dataset
 from augment import *
+from random import *
 
 
 def pad_to_square(img, pad_value):
@@ -32,101 +32,77 @@ def random_resize(images, min_size=288, max_size=448):
     return images
 
 
-class ImageFolder(Dataset):
-    def __init__(self, folder_path, img_size=416):
-        self.files = sorted(glob.glob("%s/*.*" % folder_path))
+class DetectionData(Dataset):
+    def __init__(self, file_list, img_size):
+        self.files = file_list
         self.img_size = img_size
-
-    def __getitem__(self, index):
-        img_path = self.files[index % len(self.files)]
-        img = T.ToTensor()(Image.open(img_path))
-        img, _ = pad_to_square(img, 0)
-        img = resize(img, self.img_size)
-        return img_path, img
+        # self.transform = T.Compose([T.ToPILImage(), T.ToTensor()])
 
     def __len__(self):
         return len(self.files)
 
-
-class ListDataSet(Dataset):
-    def __len__(self, list_path, img_size=416, augment=True,
-                multiscale=True, normalized_labels=True):
-        with open(list_path, 'r') as file:
-            self.img_files = file.readlines()
-            file.close()
-        self.label_files = [
-                            path.replace("images", "labels")
-                                .replace(".png", ".txt")
-                                .replace(".jpg", ".txt")
-                            for path in self.img_files
-                            ]
-        self.img_size = img_size
-        self.max_objects = 100
-        self.augment = augment
-        self.multiscale = multiscale
-        self.normalized_labels = normalized_labels
-        self.min_size = self.img_size - 3 * 32
-        self.max_size = self.img_size + 3 * 32
-        self.batch_count = 0
-
     def __getitem__(self, index):
+        image_path = self.files[index][0]
+        label_path = self.files[index][1]
+        img = np.asarray(Image.open(image_path))
+        boxes = torch.from_numpy(np.loadtxt(label_path).reshape(-1, 5))
+        img_tensor = T.ToTensor()(img)
+        _, img_h, img_w = img_tensor.shape
 
-        # image
-        img_path = self.img_files[index % len(self.img_files)].replace()
-        img = T.ToTensor()(Image.open(img_path).convert('RGB'))
-        if len(img.shape) != 3:
-            img = img.unsqueeze(0)
-            img = img.expand((3, img.shape[1:]))
-        _, h, w = img.shape
-        h_factor, w_factor = (h, w) if self.normalized_labels else (1, 1)
-        img, pad = pad_to_square(img, 0)
-        _, padded_h, padded_w = img.shape
+        xmin = (boxes[:, 1] - boxes[:, 3] / 2) * img_w
+        ymin = (boxes[:, 2] - boxes[:, 4] / 2) * img_h
+        xmax = (boxes[:, 1] + boxes[:, 3] / 2) * img_w
+        ymax = (boxes[:, 2] + boxes[:, 4] / 2) * img_h
 
-        # label
-        label_path = self.label_files[index % len(self.img_files)].rstrip()
-        targets = None
-        if os.path.exists(label_path):
-            boxes = torch.from_numpy((np.loadtxt(label_path).reshape(-1, 5)))
-            x1 = w_factor * (boxes[:, 1] - boxes[:, 3] / 2)
-            y1 = h_factor * (boxes[:, 2] - boxes[:, 4] / 2)
-            x2 = w_factor * (boxes[:, 1] + boxes[:, 3] / 2)
-            y2 = h_factor * (boxes[:, 2] + boxes[:, 4] / 2)
+        img_padded, pads = pad_to_square(img_tensor, 0)
+        _, h_padded, w_padded = img_padded.shape
 
-            x1 += pad[0]
-            y1 += pad[2]
-            x2 += pad[1]
-            y2 += pad[3]
+        xmin += pads[0]
+        ymin += pads[2]
+        xmax += pads[1]
+        ymax += pads[3]
 
-            boxes[:, 1] = ((x1 + x2) / 2) / padded_w
-            boxes[:, 2] = ((y1 + y2) / 2) / padded_h
-            boxes[:, 3] *= w_factor / padded_w
-            boxes[:, 4] *= h_factor / padded_h
-            targets = torch.zeros((len(boxes), 6))
-            targets[:, 1:] = boxes
-        if self.augment:
-            if np.random.random() < 0.5:
-                img, targets = horisontal_flip(img, targets)
-        return img, targets
+        boxes[:, 1] = ((xmin + xmax) / 2) / w_padded
+        boxes[:, 2] = ((ymin + ymax) / 2) / h_padded
+        boxes[:, 3] = (xmax - xmin) / w_padded
+        boxes[:, 4] = (ymax - ymin) / h_padded
+        target = torch.zeros((len(boxes), 6))
+        target[:, 1:] = boxes
+        return img_tensor, target, image_path
 
     def collate_fn(self, batch):
-        imgs, targets = list(zip(*batch))
-        targets = [boxes for boxes in targets if boxes is not None]
-        for i, boxes in enumerate(targets):
-            boxes[:, 0] = i
+        imgs, targets, img_path = list(zip(*batch))
+        targets = [target for target in targets if target is not None]
+        for i, target in enumerate(targets):
+            target[:, 0] = i
         targets = torch.cat(targets, 0)
-
-        if self.multiscale and self.batch_count % 10 == 0:
-            self.img_size = random.choice(range(self.min_size, self.max_size + 1, 32))
         imgs = torch.stack([resize(img, self.img_size) for img in imgs])
-        self.batch_count += 1
-        return imgs, targets
+        return imgs, targets, img_path
 
-    def __len__(self):
-        return len(self.img_files)
+
+
+class DetectionDataLoader(Dataset):
+    def __init__(self, args):
+        name_lists = os.listdir(args.train_img_path)
+        imgs_path = [os.path.join(args.train_img_path, name) for name in name_lists]
+        labels_path = [os.path.join(args.train_label_path, name.replace('jpg', 'txt')) for name in name_lists]
+        self.input_files = [(x, y) for x, y in zip(imgs_path, labels_path)]
+        shuffle(self.input_files)
+        self.train_data_loader = DetectionData(self.input_files, args.img_size)
+        self.val_data_loader = DetectionData(sample(self.input_files, int(len(self.input_files) * 0.2)), args.img_size)
+        if args.val_rate > 0:
+            train_size = int(len(self.input_files) * (1 - args.val_rate))
+            self.train_data_loader = DetectionData(self.input_files[:train_size], args.img_size)
+            self.val_data_loader = DetectionData(self.input_files[train_size:], args.img_size)
 
 
 if __name__ == "__main__":
-    cuda = torch.cuda()
-
-
-
+    image_path = "./train_data/sample/JPEGImages/000005.jpg"
+    label_path = "./train_data/sample/labels/000005.txt"
+    img = np.asarray(Image.open(image_path))
+    img_h, img_w, img_c = img.shape
+    print(f"img_c {img_c}, img_h {img_h}, img_w {img_w}")
+    boxes = torch.from_numpy(np.loadtxt(label_path).reshape(-1, 5))
+    print(f"boxes:{boxes}")
+    img_tensor = T.ToTensor()(img)
+    print(f"img_tensor.shape{img_tensor.shape}")
